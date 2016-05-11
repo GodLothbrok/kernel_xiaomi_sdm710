@@ -3300,8 +3300,8 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 
 	if (icsk->icsk_ca_ops->pkts_acked) {
 		struct ack_sample sample = { .pkts_acked = pkts_acked,
-					     .rtt_us = ca_rtt_us,
-					     .in_flight = last_in_flight };
+
+					     .rtt_us = ca_rtt_us };
 
 		icsk->icsk_ca_ops->pkts_acked(sk, &sample);
 	}

@@ -904,28 +904,7 @@ union tcp_cc_info;
 struct ack_sample {
 	u32 pkts_acked;
 	s32 rtt_us;
-	u32 in_flight;
-};
 
-/* A rate sample measures the number of (original/retransmitted) data
- * packets delivered "delivered" over an interval of time "interval_us".
- * The tcp_rate.c code fills in the rate sample, and congestion
- * control modules that define a cong_control function to run at the end
- * of ACK processing can optionally chose to consult this sample when
- * setting cwnd and pacing rate.
- * A sample is invalid if "delivered" or "interval_us" is negative.
- */
-struct rate_sample {
-	struct	skb_mstamp prior_mstamp; /* starting timestamp for interval */
-	u32  prior_delivered;	/* tp->delivered at "prior_mstamp" */
-	s32  delivered;		/* number of packets delivered over interval */
-	long interval_us;	/* time for tp->delivered to incr "delivered" */
-	long rtt_us;		/* RTT of last (S)ACKed packet (or -1) */
-	int  losses;		/* number of packets marked lost upon ACK */
-	u32  acked_sacked;	/* number of packets newly (S)ACKed upon ACK */
-	u32  prior_in_flight;	/* in flight before this ACK */
-	bool is_app_limited;	/* is sample from packet with bubble in pipe? */
-	bool is_retrans;	/* is sample from retransmission? */
 };
 
 struct tcp_congestion_ops {
@@ -952,14 +931,6 @@ struct tcp_congestion_ops {
 	u32  (*undo_cwnd)(struct sock *sk);
 	/* hook for packet ack accounting (optional) */
 	void (*pkts_acked)(struct sock *sk, const struct ack_sample *sample);
-	/* suggest number of segments for each skb to transmit (optional) */
-	u32 (*tso_segs_goal)(struct sock *sk);
-	/* returns the multiplier used in tcp_sndbuf_expand (optional) */
-	u32 (*sndbuf_expand)(struct sock *sk);
-	/* call when packets are delivered to update cwnd and pacing rate,
-	 * after all the ca_state processing. (optional)
-	 */
-	void (*cong_control)(struct sock *sk, const struct rate_sample *rs);
 	/* get info for inet_diag (optional) */
 	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
 			   union tcp_cc_info *info);
