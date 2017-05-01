@@ -4443,11 +4443,9 @@ static struct elevator_type iosched_bfq = {
 
 static int __init bfq_init(void)
 {
-	/*
-	 * Can be 0 on HZ < 1000 setups.
-	 */
-	if (bfq_slice_idle == 0)
-		bfq_slice_idle = 1;
+
+	int ret;
+	char msg[60] = "BFQ I/O-scheduler: v8r11";
 
 	if (bfq_timeout_async == 0)
 		bfq_timeout_async = 1;
