@@ -573,15 +573,14 @@ static inline unsigned int bfq_wr_duration(struct bfq_data *bfqd)
 	return dur;
 }
 
-static inline unsigned
-bfq_bfqq_cooperations(struct bfq_queue *bfqq)
-{
-	return bfqq->bic ? bfqq->bic->cooperations : 0;
-}
+static void
+bfq_bfqq_resume_state(struct bfq_queue *bfqq, struct bfq_data *bfqd,
+		      struct bfq_io_cq *bic, bool bfq_already_existing)
 
-static inline void
-bfq_bfqq_resume_state(struct bfq_queue *bfqq, struct bfq_io_cq *bic)
 {
+	unsigned int old_wr_coeff;
+	bool busy = bfq_already_existing && bfq_bfqq_busy(bfqq);
+
 	if (bic->saved_idle_window)
 		bfq_mark_bfqq_idle_window(bfqq);
 	else
@@ -590,27 +589,42 @@ bfq_bfqq_resume_state(struct bfq_queue *bfqq, struct bfq_io_cq *bic)
 		bfq_mark_bfqq_IO_bound(bfqq);
 	else
 		bfq_clear_bfqq_IO_bound(bfqq);
-	/* Assuming that the flag in_large_burst is already correctly set */
-	if (bic->wr_time_left && bfqq->bfqd->low_latency &&
-	    !bfq_bfqq_in_large_burst(bfqq) &&
-	    bic->cooperations < bfqq->bfqd->bfq_coop_thresh) {
-		/*
-		 * Start a weight raising period with the duration given by
-		 * the raising_time_left snapshot.
-		 */
-		if (bfq_bfqq_busy(bfqq))
-			bfqq->bfqd->wr_busy_queues++;
-		bfqq->wr_coeff = bfqq->bfqd->bfq_wr_coeff;
-		bfqq->wr_cur_max_time = bic->wr_time_left;
-		bfqq->last_wr_start_finish = jiffies;
-		bfqq->entity.ioprio_changed = 1;
+
+	if (unlikely(busy))
+		old_wr_coeff = bfqq->wr_coeff;
+
+	bfqq->wr_coeff = bic->saved_wr_coeff;
+	bfqq->wr_start_at_switch_to_srt = bic->saved_wr_start_at_switch_to_srt;
+	BUG_ON(time_is_after_jiffies(bfqq->wr_start_at_switch_to_srt));
+	bfqq->last_wr_start_finish = bic->saved_last_wr_start_finish;
+	bfqq->wr_cur_max_time = bic->saved_wr_cur_max_time;
+	BUG_ON(time_is_after_jiffies(bfqq->last_wr_start_finish));
+
+	if (bfqq->wr_coeff > 1 && (bfq_bfqq_in_large_burst(bfqq) ||
+				   time_is_before_jiffies(bfqq->last_wr_start_finish +
+							  bfqq->wr_cur_max_time))) {
+		bfq_log_bfqq(bfqq->bfqd, bfqq,
+			     "resume state: switching off wr (%lu + %lu < %lu)",
+			     bfqq->last_wr_start_finish, bfqq->wr_cur_max_time,
+			     jiffies);
+
+		bfqq->wr_coeff = 1;
 	}
-	/*
-	 * Clear wr_time_left to prevent bfq_bfqq_save_state() from
-	 * getting confused about the queue's need of a weight-raising
-	 * period.
-	 */
-	bic->wr_time_left = 0;
+
+	/* make sure weight will be updated, however we got here */
+	bfqq->entity.prio_changed = 1;
+
+	if (likely(!busy))
+		return;
+
+	if (old_wr_coeff == 1 && bfqq->wr_coeff > 1) {
+		bfqd->wr_busy_queues++;
+		BUG_ON(bfqd->wr_busy_queues > bfqd->busy_queues);
+	} else if (old_wr_coeff > 1 && bfqq->wr_coeff == 1) {
+		bfqd->wr_busy_queues--;
+		BUG_ON(bfqd->wr_busy_queues < 0);
+	}
+
 }
 
 /* Must be called with the queue_lock held. */
@@ -1077,11 +1091,214 @@ static inline void bfq_deactivate_request(struct request_queue *q,
 	bfqd->rq_in_driver--;
 }
 
+	if (!bfq_bfqq_IO_bound(bfqq)) {
+		if (arrived_in_time) {
+			bfqq->requests_within_timer++;
+			if (bfqq->requests_within_timer >=
+			    bfqd->bfq_requests_within_timer)
+				bfq_mark_bfqq_IO_bound(bfqq);
+		} else
+			bfqq->requests_within_timer = 0;
+		bfq_log_bfqq(bfqd, bfqq, "requests in time %d",
+			     bfqq->requests_within_timer);
+	}
+
+	if (bfqd->low_latency) {
+		if (unlikely(time_is_after_jiffies(bfqq->split_time)))
+			/* wraparound */
+			bfqq->split_time =
+				jiffies - bfqd->bfq_wr_min_idle_time - 1;
+
+		if (time_is_before_jiffies(bfqq->split_time +
+					   bfqd->bfq_wr_min_idle_time)) {
+			bfq_update_bfqq_wr_on_rq_arrival(bfqd, bfqq,
+							 old_wr_coeff,
+							 wr_or_deserves_wr,
+							 *interactive,
+							 in_burst,
+							 soft_rt);
+
+			if (old_wr_coeff != bfqq->wr_coeff)
+				bfqq->entity.prio_changed = 1;
+		}
+	}
+
+	bfqq->last_idle_bklogged = jiffies;
+	bfqq->service_from_backlogged = 0;
+	bfq_clear_bfqq_softrt_update(bfqq);
+
+	bfq_add_bfqq_busy(bfqd, bfqq);
+
+	/*
+	 * Expire in-service queue only if preemption may be needed
+	 * for guarantees. In this respect, the function
+	 * next_queue_may_preempt just checks a simple, necessary
+	 * condition, and not a sufficient condition based on
+	 * timestamps. In fact, for the latter condition to be
+	 * evaluated, timestamps would need first to be updated, and
+	 * this operation is quite costly (see the comments on the
+	 * function bfq_bfqq_update_budg_for_activation).
+	 */
+	if (bfqd->in_service_queue && bfqq_wants_to_preempt &&
+	    bfqd->in_service_queue->wr_coeff < bfqq->wr_coeff &&
+	    next_queue_may_preempt(bfqd)) {
+		struct bfq_queue *in_serv =
+			bfqd->in_service_queue;
+		BUG_ON(in_serv == bfqq);
+
+		bfq_bfqq_expire(bfqd, bfqd->in_service_queue,
+				false, BFQ_BFQQ_PREEMPTED);
+	}
+}
+
+static void bfq_add_request(struct request *rq)
+{
+	struct bfq_queue *bfqq = RQ_BFQQ(rq);
+	struct bfq_data *bfqd = bfqq->bfqd;
+	struct request *next_rq, *prev;
+	unsigned int old_wr_coeff = bfqq->wr_coeff;
+	bool interactive = false;
+
+	bfq_log_bfqq(bfqd, bfqq, "add_request: size %u %s",
+		     blk_rq_sectors(rq), rq_is_sync(rq) ? "S" : "A");
+
+	if (bfqq->wr_coeff > 1) /* queue is being weight-raised */
+		bfq_log_bfqq(bfqd, bfqq,
+			"raising period dur %u/%u msec, old coeff %u, w %d(%d)",
+			jiffies_to_msecs(jiffies - bfqq->last_wr_start_finish),
+			jiffies_to_msecs(bfqq->wr_cur_max_time),
+			bfqq->wr_coeff,
+			bfqq->entity.weight, bfqq->entity.orig_weight);
+
+	bfqq->queued[rq_is_sync(rq)]++;
+	bfqd->queued++;
+
+	elv_rb_add(&bfqq->sort_list, rq);
+
+	/*
+	 * Check if this request is a better next-to-serve candidate.
+	 */
+	prev = bfqq->next_rq;
+	next_rq = bfq_choose_req(bfqd, bfqq->next_rq, rq, bfqd->last_position);
+	BUG_ON(!next_rq);
+	bfqq->next_rq = next_rq;
+
+	/*
+	 * Adjust priority tree position, if next_rq changes.
+	 */
+	if (prev != bfqq->next_rq)
+		bfq_pos_tree_add_move(bfqd, bfqq);
+
+	if (!bfq_bfqq_busy(bfqq)) /* switching to busy ... */
+		bfq_bfqq_handle_idle_busy_switch(bfqd, bfqq, old_wr_coeff,
+						 rq, &interactive);
+	else {
+		if (bfqd->low_latency && old_wr_coeff == 1 && !rq_is_sync(rq) &&
+		    time_is_before_jiffies(
+				bfqq->last_wr_start_finish +
+				bfqd->bfq_wr_min_inter_arr_async)) {
+			bfqq->wr_coeff = bfqd->bfq_wr_coeff;
+			bfqq->wr_cur_max_time = bfq_wr_duration(bfqd);
+
+			bfqd->wr_busy_queues++;
+			BUG_ON(bfqd->wr_busy_queues > bfqd->busy_queues);
+			bfqq->entity.prio_changed = 1;
+			bfq_log_bfqq(bfqd, bfqq,
+				     "non-idle wrais starting, "
+				     "wr_max_time %u wr_busy %d",
+				     jiffies_to_msecs(bfqq->wr_cur_max_time),
+				     bfqd->wr_busy_queues);
+		}
+		if (prev != bfqq->next_rq)
+			bfq_updated_next_req(bfqd, bfqq);
+	}
+
+	/*
+	 * Assign jiffies to last_wr_start_finish in the following
+	 * cases:
+	 *
+	 * . if bfqq is not going to be weight-raised, because, for
+	 *   non weight-raised queues, last_wr_start_finish stores the
+	 *   arrival time of the last request; as of now, this piece
+	 *   of information is used only for deciding whether to
+	 *   weight-raise async queues
+	 *
+	 * . if bfqq is not weight-raised, because, if bfqq is now
+	 *   switching to weight-raised, then last_wr_start_finish
+	 *   stores the time when weight-raising starts
+	 *
+	 * . if bfqq is interactive, because, regardless of whether
+	 *   bfqq is currently weight-raised, the weight-raising
+	 *   period must start or restart (this case is considered
+	 *   separately because it is not detected by the above
+	 *   conditions, if bfqq is already weight-raised)
+	 *
+	 * last_wr_start_finish has to be updated also if bfqq is soft
+	 * real-time, because the weight-raising period is constantly
+	 * restarted on idle-to-busy transitions for these queues, but
+	 * this is already done in bfq_bfqq_handle_idle_busy_switch if
+	 * needed.
+	 */
+	if (bfqd->low_latency &&
+		(old_wr_coeff == 1 || bfqq->wr_coeff == 1 || interactive))
+		bfqq->last_wr_start_finish = jiffies;
+}
+
+static struct request *bfq_find_rq_fmerge(struct bfq_data *bfqd,
+					  struct bio *bio)
+{
+	struct task_struct *tsk = current;
+	struct bfq_io_cq *bic;
+	struct bfq_queue *bfqq;
+
+	bic = bfq_bic_lookup(bfqd, tsk->io_context);
+	if (!bic)
+		return NULL;
+
+	bfqq = bic_to_bfqq(bic, bfq_bio_sync(bio));
+	if (bfqq)
+		return elv_rb_find(&bfqq->sort_list, bio_end_sector(bio));
+
+	return NULL;
+}
+
+static sector_t get_sdist(sector_t last_pos, struct request *rq)
+{
+	sector_t sdist = 0;
+
+	if (last_pos) {
+		if (last_pos < blk_rq_pos(rq))
+			sdist = blk_rq_pos(rq) - last_pos;
+		else
+			sdist = last_pos - blk_rq_pos(rq);
+	}
+
+	return sdist;
+}
+
+static void bfq_activate_request(struct request_queue *q, struct request *rq)
+{
+	struct bfq_data *bfqd = q->elevator->elevator_data;
+	bfqd->rq_in_driver++;
+}
+
+static void bfq_deactivate_request(struct request_queue *q, struct request *rq)
+{
+	struct bfq_data *bfqd = q->elevator->elevator_data;
+
+	BUG_ON(bfqd->rq_in_driver == 0);
+	bfqd->rq_in_driver--;
+}
+
 static void bfq_remove_request(struct request *rq)
 {
 	struct bfq_queue *bfqq = RQ_BFQQ(rq);
 	struct bfq_data *bfqd = bfqq->bfqd;
 	const int sync = rq_is_sync(rq);
+
+
+	BUG_ON(bfqq->entity.service > bfqq->entity.budget &&
+	       bfqq == bfqd->in_service_queue);
 
 	if (bfqq->next_rq == rq) {
 		bfqq->next_rq = bfq_find_next_rq(bfqd, bfqq, rq);
@@ -1192,9 +1409,14 @@ static void bfq_merged_requests(struct request_queue *q, struct request *rq,
 /* Must be called with bfqq != NULL */
 static inline void bfq_bfqq_end_wr(struct bfq_queue *bfqq)
 {
-	BUG_ON(bfqq == NULL);
-	if (bfq_bfqq_busy(bfqq))
+
+	BUG_ON(!bfqq);
+
+	if (bfq_bfqq_busy(bfqq)) {
+
 		bfqq->bfqd->wr_busy_queues--;
+		BUG_ON(bfqq->bfqd->wr_busy_queues < 0);
+	}
 	bfqq->wr_coeff = 1;
 	bfqq->wr_cur_max_time = 0;
 	/* Trigger a weight change on the next activation of the queue */
@@ -1546,6 +1768,48 @@ bfq_merge_bfqqs(struct bfq_data *bfqd, struct bfq_io_cq *bic,
 	if (bfq_bfqq_IO_bound(bfqq))
 		bfq_mark_bfqq_IO_bound(new_bfqq);
 	bfq_clear_bfqq_IO_bound(bfqq);
+
+
+	/*
+	 * If bfqq is weight-raised, then let new_bfqq inherit
+	 * weight-raising. To reduce false positives, neglect the case
+	 * where bfqq has just been created, but has not yet made it
+	 * to be weight-raised (which may happen because EQM may merge
+	 * bfqq even before bfq_add_request is executed for the first
+	 * time for bfqq). Handling this case would however be very
+	 * easy, thanks to the flag just_created.
+	 */
+	if (new_bfqq->wr_coeff == 1 && bfqq->wr_coeff > 1) {
+		new_bfqq->wr_coeff = bfqq->wr_coeff;
+		new_bfqq->wr_cur_max_time = bfqq->wr_cur_max_time;
+		new_bfqq->last_wr_start_finish = bfqq->last_wr_start_finish;
+		new_bfqq->wr_start_at_switch_to_srt =
+			bfqq->wr_start_at_switch_to_srt;
+		if (bfq_bfqq_busy(new_bfqq)) {
+			bfqd->wr_busy_queues++;
+			BUG_ON(bfqd->wr_busy_queues > bfqd->busy_queues);
+		}
+
+		new_bfqq->entity.prio_changed = 1;
+		bfq_log_bfqq(bfqd, new_bfqq,
+			     "wr start after merge with %d, rais_max_time %u",
+			     bfqq->pid,
+			     jiffies_to_msecs(bfqq->wr_cur_max_time));
+	}
+
+	if (bfqq->wr_coeff > 1) { /* bfqq has given its wr to new_bfqq */
+		bfqq->wr_coeff = 1;
+		bfqq->entity.prio_changed = 1;
+		if (bfq_bfqq_busy(bfqq)) {
+			bfqd->wr_busy_queues--;
+			BUG_ON(bfqd->wr_busy_queues < 0);
+		}
+
+	}
+
+	bfq_log_bfqq(bfqd, new_bfqq, "merge_bfqqs: wr_busy %d",
+		     bfqd->wr_busy_queues);
+
 	/*
 	 * Grab a reference to the bic, to prevent it from being destroyed
 	 * before being possibly touched by a bfq_split_bfqq().
@@ -3572,7 +3836,7 @@ static int bfq_set_request(struct request_queue *q, struct request *rq,
 	struct bfq_queue *bfqq;
 	struct bfq_group *bfqg;
 	unsigned long flags;
-	bool split = false;
+	bool bfqq_already_existing = false, split = false;
 
 	might_sleep_if(gfp_mask & __GFP_WAIT);
 
@@ -3609,6 +3873,8 @@ new_queue:
 			split = true;
 			if (!bfqq)
 				goto new_queue;
+			else
+				bfqq_already_existing = true;
 		}
 	}
 
@@ -3636,7 +3902,8 @@ new_queue:
 			 * queue, restore the idle window and the possible
 			 * weight raising period.
 			 */
-			bfq_bfqq_resume_state(bfqq, bic);
+			bfq_bfqq_resume_state(bfqq, bfqd, bic,
+					      bfqq_already_existing);
 		}
 	}
 
