@@ -806,6 +806,7 @@ __bfq_entity_update_weight_prio(struct bfq_service_tree *old_st,
 		}
 #endif
 
+		BUG_ON(entity->tree && update_class_too);
 		BUG_ON(old_st->wsum < entity->weight);
 		old_st->wsum -= entity->weight;
 
@@ -871,8 +872,10 @@ __bfq_entity_update_weight_prio(struct bfq_service_tree *old_st,
 
 		new_st->wsum += entity->weight;
 
-		if (new_st != old_st)
+		if (new_st != old_st) {
+			BUG_ON(!update_class_too);
 			entity->start = new_st->vtime;
+		}
 	}
 
 	return new_st;
@@ -976,7 +979,14 @@ static void bfq_update_fin_time_enqueue(struct bfq_entity *entity,
 	struct bfq_queue *bfqq = bfq_entity_to_bfqq(entity);
 	struct bfq_sched_data *sd = entity->sched_data;
 
-	st = __bfq_entity_update_weight_prio(st, entity);
+	/*
+	 * When this function is invoked, entity is not in any service
+	 * tree, then it is safe to invoke next function with the last
+	 * parameter set (see the comments on the function).
+	 */
+	BUG_ON(entity->tree);
+	st = __bfq_entity_update_weight_prio(st, entity, true);
+
 	bfq_calc_finish(entity, entity->budget);
 
 	/*
@@ -1093,9 +1103,11 @@ static void __bfq_activate_entity(struct bfq_entity *entity,
 		 * check for that.
 		 */
 		bfq_idle_extract(st, entity);
+		BUG_ON(entity->tree);
 		entity->start = bfq_gt(min_vstart, entity->finish) ?
 			min_vstart : entity->finish;
 	} else {
+		BUG_ON(entity->tree);
 		/*
 		 * The finish time of the entity may be invalid, and
 		 * it is in the past for sure, otherwise the queue
@@ -1180,6 +1192,7 @@ static void __bfq_requeue_entity(struct bfq_entity *entity)
 		 */
 		bfq_calc_finish(entity, entity->service);
 		entity->start = entity->finish;
+		BUG_ON(entity->tree && entity->tree == &st->idle);
 		BUG_ON(entity->tree && entity->tree != &st->active);
 		/*
 		 * In addition, if the entity had more than one child
