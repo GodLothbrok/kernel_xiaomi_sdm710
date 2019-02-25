@@ -38,8 +38,9 @@
 #include <linux/seq_file.h>
 #endif
 
-#ifdef CONFIG_EXPOSURE_ADJUSTMENT
-#include "exposure_adjustment.h"
+#ifdef CONFIG_KLAPSE
+#include "../sde/klapse.h"
+
 #endif
 
 /**
@@ -829,6 +830,10 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	panel->last_bl_lvl = bl_lvl;
 	if (!bl_lvl && panel->hist_bl_offset)
 		 panel->hist_bl_offset = 0;
+
+#ifdef CONFIG_KLAPSE
+	set_rgb_slider(bl_lvl);
+#endif
 
 	return rc;
 }
