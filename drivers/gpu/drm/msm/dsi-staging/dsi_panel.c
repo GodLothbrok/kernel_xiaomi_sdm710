@@ -39,7 +39,8 @@
 #endif
 
 #ifdef CONFIG_KLAPSE
-#include "../sde/klapse.h"
+
+#include <linux/klapse.h>
 
 #endif
 
