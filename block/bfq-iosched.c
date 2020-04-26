@@ -5287,7 +5287,7 @@ static int __init bfq_init(void)
 {
 
 	int ret;
-	char msg[60] = "BFQ I/O-scheduler: v8r12";
+	char msg[60] = "BFQ I/O-scheduler: v8r11";
 
 #ifdef CONFIG_BFQ_GROUP_IOSCHED
 	ret = blkcg_policy_register(&blkcg_policy_bfq);
