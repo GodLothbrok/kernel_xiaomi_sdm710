@@ -594,28 +594,9 @@ static void bfq_forget_idle(struct bfq_service_tree *st)
 		bfq_put_idle_entity(st, first_idle);
 }
 
-/*
- * Update weight and priority of entity. If update_class_too is true,
- * then update the ioprio_class of entity too.
- *
- * The reason why the update of ioprio_class is controlled through the
- * last parameter is as follows. Changing the ioprio class of an
- * entity implies changing the destination service trees for that
- * entity. If such a change occurred when the entity is already on one
- * of the service trees for its previous class, then the state of the
- * entity would become more complex: none of the new possible service
- * trees for the entity, according to bfq_entity_service_tree(), would
- * match any of the possible service trees on which the entity
- * is. Complex operations involving these trees, such as entity
- * activations and deactivations, should take into account this
- * additional complexity.  To avoid this issue, this function is
- * invoked with update_class_too unset in the points in the code where
- * entity may happen to be on some tree.
- */
 static struct bfq_service_tree *
 __bfq_entity_update_weight_prio(struct bfq_service_tree *old_st,
-				struct bfq_entity *entity,
-				bool update_class_too)
+			 struct bfq_entity *entity)
 {
 	struct bfq_service_tree *new_st = old_st;
 
@@ -657,15 +638,8 @@ __bfq_entity_update_weight_prio(struct bfq_service_tree *old_st,
 				bfq_weight_to_ioprio(entity->orig_weight);
 		}
 
-		if (bfqq && update_class_too)
-			bfqq->ioprio_class = bfqq->new_ioprio_class;
-
-		/*
-		 * Reset prio_changed only if the ioprio_class change
-		 * is not pending any longer.
-		 */
-		if (!bfqq || bfqq->ioprio_class == bfqq->new_ioprio_class)
-			entity->prio_changed = 0;
+		entity->ioprio_class = entity->new_ioprio_class;
+		entity->ioprio_changed = 0;
 
 		/*
 		 * NOTE: here we may be changing the weight too early,
@@ -753,116 +727,7 @@ static inline void bfq_bfqq_charge_full_budget(struct bfq_queue *bfqq)
 
 	bfq_log_bfqq(bfqq->bfqd, bfqq, "charge_full_budget");
 
-	if (tot_serv_to_charge < entity->service)
-		tot_serv_to_charge = entity->service;
-
-	bfq_log_bfqq(bfqq->bfqd, bfqq,
-		     "charge_time: %lu/%u ms, %d/%d/%d sectors",
-		     time_ms, timeout_ms, entity->service,
-		     tot_serv_to_charge, entity->budget);
-
-	/* Increase budget to avoid inconsistencies */
-	if (tot_serv_to_charge > entity->budget)
-		entity->budget = tot_serv_to_charge;
-
-	bfq_bfqq_served(bfqq,
-			max_t(int, 0, tot_serv_to_charge - entity->service));
-}
-
-static void bfq_update_fin_time_enqueue(struct bfq_entity *entity,
-					struct bfq_service_tree *st,
-					bool backshifted)
-{
-	struct bfq_queue *bfqq = bfq_entity_to_bfqq(entity);
-	struct bfq_sched_data *sd = entity->sched_data;
-
-	/*
-	 * When this function is invoked, entity is not in any service
-	 * tree, then it is safe to invoke next function with the last
-	 * parameter set (see the comments on the function).
-	 */
-	st = __bfq_entity_update_weight_prio(st, entity, true);
-	bfq_calc_finish(entity, entity->budget);
-
-	/*
-	 * If some queues enjoy backshifting for a while, then their
-	 * (virtual) finish timestamps may happen to become lower and
-	 * lower than the system virtual time.  In particular, if
-	 * these queues often happen to be idle for short time
-	 * periods, and during such time periods other queues with
-	 * higher timestamps happen to be busy, then the backshifted
-	 * timestamps of the former queues can become much lower than
-	 * the system virtual time. In fact, to serve the queues with
-	 * higher timestamps while the ones with lower timestamps are
-	 * idle, the system virtual time may be pushed-up to much
-	 * higher values than the finish timestamps of the idle
-	 * queues. As a consequence, the finish timestamps of all new
-	 * or newly activated queues may end up being much larger than
-	 * those of lucky queues with backshifted timestamps. The
-	 * latter queues may then monopolize the device for a lot of
-	 * time. This would simply break service guarantees.
-	 *
-	 * To reduce this problem, push up a little bit the
-	 * backshifted timestamps of the queue associated with this
-	 * entity (only a queue can happen to have the backshifted
-	 * flag set): just enough to let the finish timestamp of the
-	 * queue be equal to the current value of the system virtual
-	 * time. This may introduce a little unfairness among queues
-	 * with backshifted timestamps, but it does not break
-	 * worst-case fairness guarantees.
-	 *
-	 * As a special case, if bfqq is weight-raised, push up
-	 * timestamps much less, to keep very low the probability that
-	 * this push up causes the backshifted finish timestamps of
-	 * weight-raised queues to become higher than the backshifted
-	 * finish timestamps of non weight-raised queues.
-	 */
-	if (backshifted && bfq_gt(st->vtime, entity->finish)) {
-		unsigned long delta = st->vtime - entity->finish;
-
-		if (bfqq)
-			delta /= bfqq->wr_coeff;
-
-		entity->start += delta;
-		entity->finish += delta;
-
-		if (bfqq) {
-			bfq_log_bfqq(bfqq->bfqd, bfqq,
-				     "__activate_entity: new queue finish %llu",
-				     ((entity->finish>>10)*1000)>>12);
-#ifdef CONFIG_BFQ_GROUP_IOSCHED
-		} else {
-			struct bfq_group *bfqg =
-				container_of(entity, struct bfq_group, entity);
-
-			bfq_log_bfqg((struct bfq_data *)bfqg->bfqd, bfqg,
-				     "__activate_entity: new group finish %llu",
-				     ((entity->finish>>10)*1000)>>12);
-#endif
-		}
-	}
-
-	bfq_active_insert(st, entity);
-
-	if (bfqq) {
-		bfq_log_bfqq(bfqq->bfqd, bfqq,
-			"__activate_entity: queue %seligible in st %p",
-			     entity->start <= st->vtime ? "" : "non ", st);
-#ifdef CONFIG_BFQ_GROUP_IOSCHED
-	} else {
-		struct bfq_group *bfqg =
-			container_of(entity, struct bfq_group, entity);
-
-		bfq_log_bfqg((struct bfq_data *)bfqg->bfqd, bfqg,
-			"__activate_entity: group %seligible in st %p",
-			     entity->start <= st->vtime ? "" : "non ", st);
-#endif
-	}
-	BUG_ON(RB_EMPTY_ROOT(&st->active));
-	BUG_ON(&st->active != &sd->service_tree->active &&
-	       &st->active != &(sd->service_tree+1)->active &&
-	       &st->active != &(sd->service_tree+2)->active);
-
+	bfq_bfqq_served(bfqq, entity->budget - entity->service);
 }
 
 /**
