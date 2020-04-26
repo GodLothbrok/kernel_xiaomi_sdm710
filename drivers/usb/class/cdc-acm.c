@@ -863,9 +863,10 @@ static int set_serial_info(struct acm *acm,
 
 	mutex_lock(&acm->port.mutex);
 
-	if ((new_serial.close_delay != old_close_delay) ||
-            (new_serial.closing_wait != old_closing_wait)) {
-		if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_SYS_ADMIN)) {
+		if ((new_serial.close_delay != old_close_delay) ||
+	            (new_serial.closing_wait != old_closing_wait))
+
 			retval = -EPERM;
 		else {
 			acm->port.close_delay  = close_delay;
@@ -916,7 +917,7 @@ static int wait_serial_change(struct acm *acm, unsigned long arg)
 		}
 	} while (!rv);
 
-	
+
 
 	return rv;
 }
